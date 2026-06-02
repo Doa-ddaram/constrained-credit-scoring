@@ -1,0 +1,3 @@
+[submodule "Marabou"]
+	path = Marabou
+	url = https://github.com/NeuralNetworkVerification/Marabou.git
