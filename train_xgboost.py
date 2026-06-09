@@ -1,4 +1,5 @@
 import os
+import argparse
 
 import xgboost as xgb
 from sklearn.metrics import accuracy_score
@@ -24,10 +25,9 @@ def build_monotone_constraints(feature_names):
     return monotone_constraints
 
 
-def train_xgboost_with_monotone_constraints():
+def train_xgboost_with_monotone_constraints(n_estimators=100, max_depth=5, learning_rate=0.1, save_dir="saved_weights"):
     data = load_and_preprocess_data()
     feature_names = data["feature_names"]
-    save_dir = "saved_weights"
     os.makedirs(save_dir, exist_ok=True)
     best_model_path = os.path.join(save_dir, "best_xgboost.json")
 
@@ -38,9 +38,9 @@ def train_xgboost_with_monotone_constraints():
     )
 
     model = xgb.XGBClassifier(
-        n_estimators=100,
-        max_depth=5,
-        learning_rate=0.1,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
         monotone_constraints=tuple(monotone_constraints),
         random_state=42,
     )
@@ -59,4 +59,12 @@ def train_xgboost_with_monotone_constraints():
 
 
 if __name__ == "__main__":
-    train_xgboost_with_monotone_constraints()
+
+    parser = argparse.ArgumentParser(description="Train XGBoost with monotonic constraints")
+    parser.add_argument("--n-estimators", type=int, default=100)
+    parser.add_argument("--max-depth", type=int, default=5)
+    parser.add_argument("--learning-rate", type=float, default=0.1)
+    parser.add_argument("--save-dir", type=str, default="saved_weights")
+    args = parser.parse_args()
+
+    train_xgboost_with_monotone_constraints(n_estimators=args.n_estimators, max_depth=args.max_depth, learning_rate=args.learning_rate, save_dir=args.save_dir)
