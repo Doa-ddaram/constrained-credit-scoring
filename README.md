@@ -1,69 +1,93 @@
-**Project Overview**
-- **Purpose**: 이 폴더는 신용점수(loan approval) 모델들에 대해 MILP(정수선형계획)를 이용한 검증과 분석을 제공합니다. 주요 스크립트 `verification_milp.py`는 XGBoost와 간단한 MLP 모델을 MILP로 인코딩하여 다음과 같은 속성을 자동으로 검증합니다: monotonicity, individual fairness, local robustness, recourse, 그리고 compare.
+# 🏦 Constrained Credit Scoring: MILP 기반 신용평가 모델 검증 프레임워크
 
-**Quick Start**
-- **Dependencies**: 프로젝트 루트의 [requirements.txt](requirements.txt)을 확인해 필요한 패키지를 설치하세요.
+## 📖 프로젝트 개요 (Overview)
+본 프로젝트는 머신러닝 기반의 **신용 평가 및 대출 심사(Loan Approval) 모델**이 신뢰할 수 있고 공정하게 작동하는지 검증하는 프레임워크입니다. 
 
+트리 기반 모델(XGBoost)과 신경망 모델(MLP)을 혼합 정수 선형 계획법(MILP, Mixed-Integer Linear Programming)으로 인코딩하여, 모델이 사전에 정의된 정형적 속성(단조성, 공정성 등)을 완벽히 준수하는지 수학적으로 증명하거나 그 위배 사례(Counterexample)를 자동으로 탐색합니다.
+
+---
+
+## ✨ 핵심 검증 속성 (Key Properties)
+
+`verification_milp.py`를 통해 다음 5가지 주요 속성을 검증할 수 있습니다.
+
+1. **단조성 (Monotonicity)**
+   - 자산이나 소득 등 긍정적인 요인이 증가했을 때, 대출 승인 확률이 불합리하게 감소하는 역전 현상이 없는지 검증합니다.
+2. **개별 공정성 (Individual Fairness)**
+   - 나이, 성별 등 '민감한 피처(Sensitive Features)'만 다르고 나머지 조건이 완벽히 동일한 두 사용자에 대해 모델이 다른 판정을 내리는 차별 사례를 찾습니다.
+3. **지역적 강건성 (Local Robustness)**
+   - 입력 데이터에 미세한 노이즈($L_\infty$-ball 반경 내)가 추가되었을 때, 승인/거절 결과가 갑작스럽게 뒤집히는 적대적 반례를 탐색합니다.
+4. **역조치 제안 (Counterfactual Recourse)**
+   - 대출이 '거절'된 고객을 대상으로, '승인'을 받기 위해 현실적으로 변경해야 하는 최소한의 조건(예: 신용카드 사용액 감소 등)을 행동 비용 기반으로 산출합니다.
+5. **모델 비교 (Model Comparison)**
+   - 구조가 다른 두 모델(XGBoost와 MLP)이 동일한 입력에 대해 서로 다른 결과를 내는 경계 영역을 찾아내어 모델 전환 시의 리스크를 분석합니다.
+
+---
+
+## 📂 파일 구조 (Project Structure)
+
+```text
+constrained-credit-scoring/
+├── saved_weights/           # 학습이 완료된 모델 가중치 파일 저장소
+│   ├── best_baseline_mlp.pth
+│   └── best_xgboost.json
+├── dataset.py               # 데이터 로드, 전처리 및 테스트 샘플 제공
+├── prepare_models.py        # 모델 작동 스크립트
+├── train_baseline_mlp.py    # MLP 모델 학습 스크립트
+├── train_xgboost.py         # XGBoost 모델 학습 스크립트
+├── verification_milp.py     # MILP 검증 엔진 (메인 스크립트)
+└── requirements.txt         # 파이썬 패키지 명세
+```
+
+---
+
+## 🚀 빠른 시작 (Quick Start)
+
+### 1. 의존성 설치
+최적화 문제 풀이를 위한 PuLP 및 필요한 머신러닝 라이브러리를 설치합니다.
 ```bash
 pip install -r requirements.txt
 ```
 
-- **예제 실행**: 기본적으로 `verification_milp.py`는 저장된 모델 파일을 `saved_weights/`에서 읽습니다. 간단한 실행 예:
-
-```bash
-python verification_milp.py --property compare
-python verification_milp.py --property local_robustness --sample-index 0 --epsilon 0.01
-python verification_milp.py --property recourse --sample-index 0
-```
-
-**주요 파일**
-- **verification_milp.py**: MILP 기반 검증 도구의 본체. 모델을 MILP로 인코딩하고 PuLP를 통해 최적화 문제를 풀어 위배 사례(violations)나 최소 변경(recourse)을 찾습니다. 상세 동작은 아래 섹션을 참고하세요. (파일: [verification_milp.py](verification_milp.py))
-- **dataset.py**: 데이터 로드 및 전처리 유틸리티로, `verification_milp.py` 실행 시 특성 이름(`feature_names`)과 테스트 입력을 제공합니다. (파일: [dataset.py](dataset.py))
-- **train_baseline_mlp.py**, **train_xgboost.py**: 모델 학습 스크립트로, 결과 모델은 `saved_weights/`에 저장됩니다. (파일들: [train_baseline_mlp.py](train_baseline_mlp.py), [train_xgboost.py](train_xgboost.py))
-- **saved_weights/**: 학습된 모델 파일들(`best_baseline_mlp.pth`, `best_xgboost.json`)이 위치하는 기본 폴더.
-
-**핵심 개념 및 구현 요약**
-- **입력 쌍(x_a, x_b)**: MILP 문제는 두 입력 벡터 `x_a`(변경된/대안 입력)와 `x_b`(참조/원본)를 변수로 생성합니다. 범주형(one-hot) 피처는 바이너리 변수로 처리되고 그룹 합계가 1이 되도록 제한합니다.
-- **모델 인코딩**:
-  - `xgboost` : 각 Decision Tree를 리프 선택(binary) 변수와 분기 제약으로 표현하여 트리 예측을 선형식으로 합산합니다.
-  - `mlp` : 각각의 선형층을 그대로 변수와 선형 제약으로 인코딩하고, ReLU는 Big-M 방식(활성화 바이너리 + 연속 변수)을 사용해 MILP로 모델을 근사합니다.
-- **속성 제약(Property constraints)**:
-  - `monotonicity`: 특정 피처가 증가(혹은 감소)할 때 출력이 증가해야 한다는 제약을 추가하여 그 제약을 위배하는 `x_a`를 찾습니다.
-  - `individual_fairness`: 민감값(sensitive features)이 동일할 때 다른(비민감) 피처가 같음을 강제하여, 출력 차이를 찾습니다.
-  - `local_robustness`: 주어진 원본 `original_x`로부터 L∞-ball(반경 `epsilon`) 내에서 출력의 부호(승인/거절)가 뒤집히는 반례를 찾습니다.
-  - `recourse`: 변화 가능성(immutable, increase-only, decrease-only, flexible)을 기반으로, 가중 L1 거리(특성별 비용으로 가중)를 최소화하여 승인 결과를 얻을 수 있는 최소 변경안을 찾습니다.
-- **목적 함수 및 해석**: `recourse`는 가중 L1 거리 최소화(행동비용 최소화)를 목적함수로 설정하고, 다른 속성은 위배 사례(설정한 부등식)를 만족시키는 해를 찾는 것을 목표로 합니다. 해가 `optimal` 또는 `feasible`이면 counterexample 혹은 recourse plan을 출력합니다.
-
-**설정 가능한 주요 인자(간단 요약)**
-- `--property`: 검증할 속성 (monotonicity, individual_fairness, local_robustness, recourse, compare)
-- `--xgboost-path`, `--mlp-path`: 모델 경로 (기본은 `saved_weights/` 내부 파일)
-- `--target-feature`: monotonicity 검사 대상 피처
-- `--sensitive-features`: individual fairness 대상 피처 목록
-- `--epsilon`: local robustness의 L∞ 반경
-- `--bound-limit`: 입력 변수의 상/하한 (무분별한 값 제한)
-- `--timeout-seconds`: MILP solver 시간 제한
-
-**실행 결과 해석**
-- 출력에 포함되는 핵심 항목들: `status`(Optimal/Feasible/ infeasible 등), `solve_seconds`, `wall_seconds`, 그리고 위배가 발견되었을 때의 `xA`, `xB`, `outputA`, `outputB`.
-- `recourse`가 `Optimal`이면 추천 변경사항(각 피처별 현재값/권고값/변화량)과 함께 변경 불가능한(immutable) 피처를 명시합니다.
-
-**제약 및 참고사항**
-- MILP 기반 검증은 이론상 NP-hard이며, ReLU 활성화에 대한 Big-M 인코딩과 tree-encoding으로 인해 이진변수 수가 급증할 수 있습니다. 큰 모델이나 많은 피처에서는 풀이 시간이 크게 증가할 수 있습니다.
-- `requirements.txt`의 solver(예: HiGHS, CBC 등)가 설치되어 있으면 성능과 시간 제한을 개선할 수 있습니다.
-
-**다음 단계 제안**
-- 더 큰 모델을 다루려면 Relaxation 기법(SDP/LP-relaxation) 또는 구간 바운딩(IBP) 등의 근사 기법 도입을 고려하세요.
-- 출력 포맷(예: JSON 저장) 추가로 자동화된 리포트 파이프라인을 만들 수 있습니다.
-
----
-작성자: 자동 생성 문서 (요약본). 질문이나 추가 보강을 원하시면 알려주세요.
-# Prepare models (optional)
-If you don't yet have trained models in `saved_weights/`, run the helper script which will invoke the training scripts provided in this folder. This is optional but convenient for getting the required model files before running verification.
-
+### 2. (선택) 모델 사전 학습
+`saved_weights/` 폴더에 모델 파일이 없는 경우, 아래 명령어로 모델을 먼저 학습시킵니다.
 ```bash
 python prepare_models.py
 ```
 
-This script will run `train_baseline_mlp.py` and `train_xgboost.py` if the expected files (`saved_weights/best_baseline_mlp.pth`, `saved_weights/best_xgboost.json`) are missing.
+### 3. 검증 스크립트 실행
+검증하고자 하는 속성(`--property`)을 지정하여 메인 엔진을 실행합니다.
 
-# constrained-credit-scoring
+```bash
+# 1. 두 모델(XGBoost vs MLP) 간의 예측 불일치 사례 탐색
+python verification_milp.py --property compare
+
+# 2. 특정 샘플(index 0)에 대해 노이즈(epsilon 0.01) 내 결과가 뒤집히는지 강건성 검사
+python verification_milp.py --property local_robustness --sample-index 0 --epsilon 0.01
+
+# 3. 특정 샘플(index 0)에 대한 최소 변경 승인 조건(Recourse) 탐색
+python verification_milp.py --property recourse --sample-index 0
+```
+
+---
+
+## ⚙️ 주요 실행 옵션 (Arguments)
+
+| 옵션명 | 설명 | 예시 |
+| :--- | :--- | :--- |
+| `--property` | 검증할 속성을 선택합니다. | `compare`, `recourse`, `monotonicity` 등 |
+| `--sample-index` | 로컬 검증 시 기준이 될 테스트 데이터의 인덱스입니다. | `0`, `15` |
+| `--target-feature` | 단조성 검사 시 대상이 되는 피처 이름입니다. | `credit_amount` |
+| `--sensitive-features` | 공정성 검사 시 보호해야 할 민감 피처 목록입니다. | `age,gender` |
+| `--epsilon` | 강건성 검사 시 허용할 변화 반경($L_\infty$)입니다. | `0.01` |
+| `--timeout-seconds` | 탐색을 수행할 최대 제한 시간(초)입니다. | `300` |
+
+---
+
+## 🛠 작동 원리 (How it Works)
+
+본 프레임워크는 블랙박스 모델을 MILP 제약식으로 투명하게 변환합니다.
+- **XGBoost**: 각 의사결정 나무의 노드 분기 조건을 이진 변수(Binary Variable)로 매핑하고 리프 노드의 가중치를 선형 결합합니다.
+- **MLP**: 선형 계층은 일차 방정식으로, 비선형 활성화 함수(ReLU)는 이진 변수를 활용한 **Big-M 수식**으로 근사하여 완벽한 수학적 모델을 구성합니다.
+
+이후, 솔버(Solver)가 지정된 속성의 위배 조건(예: $y_{original} \neq y_{perturbed}$)을 목적 함수로 삼아 해를 탐색합니다. 해가 존재하면(`Optimal`/`Feasible`) 위배 사례가 있는 것이며, 해를 찾을 수 없으면(`Infeasible`) 해당 속성에 대해 모델이 안전함을 수학적으로 증명한 것입니다.
