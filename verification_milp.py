@@ -322,19 +322,55 @@ def _encode_xgboost_forward_pass(
     return pulp.lpSum(total_output)
 
 
+def _detect_categorical_groups(feature_names: Sequence[str]) -> Dict[str, List[int]]:
+    """Detect one-hot categorical groups from feature names.
+
+    Heuristic: categorical features are prefixed with 'cat__' and have suffixes
+    like '_A12' or similar. Group key is the name without the final '_' + token.
+    """
+    groups: Dict[str, List[int]] = {}
+    for i, name in enumerate(feature_names):
+        if name.startswith("cat__"):
+            # group by removing final segment after last '_'
+            if "_" in name:
+                key = name.rsplit("_", 1)[0]
+            else:
+                key = name
+            groups.setdefault(key, []).append(i)
+    return groups
+
+
 def _create_pairwise_inputs(
     problem: pulp.LpProblem,
-    input_dim: int,
+    feature_names: Sequence[str],
     bound_limit: float,
 ) -> Tuple[List[pulp.LpVariable], List[pulp.LpVariable]]:
-    x_a = [
-        pulp.LpVariable(f"xA_{index}", lowBound=-bound_limit, upBound=bound_limit, cat="Continuous")
-        for index in range(input_dim)
-    ]
-    x_b = [
-        pulp.LpVariable(f"xB_{index}", lowBound=-bound_limit, upBound=bound_limit, cat="Continuous")
-        for index in range(input_dim)
-    ]
+    """Create x_a and x_b variables. For detected categorical one-hot groups,
+    create binary variables and add group-sum==1 constraints.
+    Returns lists of variables aligned with feature_names.
+    """
+    input_dim = len(feature_names)
+    x_a: List[pulp.LpVariable] = [None] * input_dim  # type: ignore
+    x_b: List[pulp.LpVariable] = [None] * input_dim  # type: ignore
+
+    cat_groups = _detect_categorical_groups(feature_names)
+    cat_index_to_group: Dict[int, str] = {}
+    for key, indices in cat_groups.items():
+        # create binary vars for each member
+        for idx in indices:
+            x_a[idx] = pulp.LpVariable(f"xA_{idx}", lowBound=0, upBound=1, cat="Binary")
+            x_b[idx] = pulp.LpVariable(f"xB_{idx}", lowBound=0, upBound=1, cat="Binary")
+            cat_index_to_group[idx] = key
+        # sum == 1 constraint for one-hot
+        problem += pulp.lpSum(x_a[i] for i in indices) == 1, f"onehot_A_{key}"
+        problem += pulp.lpSum(x_b[i] for i in indices) == 1, f"onehot_B_{key}"
+
+    # fill remaining non-categorical vars as continuous
+    for i in range(input_dim):
+        if x_a[i] is None:
+            x_a[i] = pulp.LpVariable(f"xA_{i}", lowBound=-bound_limit, upBound=bound_limit, cat="Continuous")
+            x_b[i] = pulp.LpVariable(f"xB_{i}", lowBound=-bound_limit, upBound=bound_limit, cat="Continuous")
+
     return x_a, x_b
 
 
@@ -391,9 +427,12 @@ def _categorize_features(feature_names: Sequence[str]) -> Dict[str, List[int]]:
     Returns:
         Dict with keys: 'immutable', 'increasing_only', 'decreasing_only', 'flexible'
     """
-    immutable_keywords = ["age", "sex", "gender", "race", "foreign", "marital"]
-    increasing_keywords = ["duration", "checking", "savings", "employment", "credit_history", "score", "income"]
-    decreasing_keywords = ["debt", "liabilities", "installment", "risk"]
+    immutable_keywords = [
+        "age", "personal_status", "foreign_worker", "num_dependents",
+        "credit_history", "purpose", "residence_since", "housing", "job"
+    ]
+    increasing_keywords = ["checking_status", "savings_status", "employment"]
+    decreasing_keywords = ["duration", "credit_amount", "installment", "existing_credits", "other_payment_plans"]
     
     categorized = {
         "immutable": [],
@@ -521,7 +560,7 @@ def _build_problem_for_model(
     problem = pulp.LpProblem(f"{model_kind}_{property_name}_verification", pulp.LpMinimize)
     problem += 0
 
-    x_a, x_b = _create_pairwise_inputs(problem, input_dim, bound_limit)
+    x_a, x_b = _create_pairwise_inputs(problem, feature_names, bound_limit)
 
     if property_name == "monotonicity":
         if target_feature_name is None:
@@ -678,7 +717,10 @@ def _compute_model_output(
     input_dim = len(feature_names)
     if model_kind == "xgboost":
         booster = _load_xgboost_booster(model_path)
-        return float(booster.predict(input_x.reshape(1, -1))[0])
+
+        dmatrix_x = xgb.DMatrix(input_x.reshape(1, -1), feature_names=list(feature_names))
+        
+        return float(booster.predict(dmatrix_x)[0])
     elif model_kind == "mlp":
         layers = _load_mlp_layers(model_path, input_dim=input_dim)
         x = torch.tensor(input_x, dtype=torch.float32).unsqueeze(0)
@@ -693,6 +735,35 @@ def _compute_model_output(
         return float(x.squeeze().item())
     else:
         raise ValueError(f"unsupported model kind: {model_kind}")
+
+
+def _estimate_mlp_flops(layers: Sequence[Tuple[np.ndarray, np.ndarray]]) -> int:
+    """Estimate approximate FLOPs for an MLP forward pass (multiply-adds).
+
+    We count 2 * in_features * out_features per Linear layer (mul + add),
+    ReLU counted as negligible.
+    Returns integer approximate ops.
+    """
+    ops = 0
+    for weight, _ in layers:
+        in_f = int(weight.shape[1])
+        out_f = int(weight.shape[0])
+        ops += 2 * in_f * out_f
+    return ops
+
+
+def _estimate_xgb_ops(booster: xgb.Booster) -> int:
+    """Estimate approximate number of comparison operations for XGBoost.
+
+    Uses the tree dataframe to count non-leaf nodes (node comparisons) across trees.
+    """
+    try:
+        df = booster.trees_to_dataframe()
+    except Exception:
+        return 0
+    # nodes where Feature != 'Leaf'
+    non_leaf = df[df["Feature"] != "Leaf"]
+    return int(len(non_leaf))
 
 
 def compare_xgboost_and_mlp(
@@ -715,6 +786,19 @@ def compare_xgboost_and_mlp(
         original_output_xgb = _compute_model_output("xgboost", xgboost_path, original_x, feature_names)
         original_output_mlp = _compute_model_output("mlp", mlp_path, original_x, feature_names)
 
+    # Estimate model work
+    try:
+        booster_for_est = _load_xgboost_booster(xgboost_path)
+        est_xgb_ops = _estimate_xgb_ops(booster_for_est)
+    except Exception:
+        est_xgb_ops = None
+
+    try:
+        mlp_layers_for_est = _load_mlp_layers(mlp_path, input_dim=len(feature_names))
+        est_mlp_ops = _estimate_mlp_flops(mlp_layers_for_est)
+    except Exception:
+        est_mlp_ops = None
+
     xgb_start = time.perf_counter()
     xgb_result = verify_property_milp(
         model_kind="xgboost",
@@ -731,6 +815,7 @@ def compare_xgboost_and_mlp(
         original_output=original_output_xgb,
     )
     xgb_result["wall_seconds"] = time.perf_counter() - xgb_start
+    xgb_result["estimated_ops"] = est_xgb_ops
 
     mlp_start = time.perf_counter()
     mlp_result = verify_property_milp(
@@ -748,8 +833,34 @@ def compare_xgboost_and_mlp(
         original_output=original_output_mlp,
     )
     mlp_result["wall_seconds"] = time.perf_counter() - mlp_start
+    mlp_result["estimated_ops"] = est_mlp_ops
 
-    return {"xgboost": xgb_result, "mlp": mlp_result}
+    # Compute violation severity for monotonicity-like properties
+    def _severity(res: Dict[str, Any]) -> Optional[float]:
+        if res.get("status", "").lower() in {"optimal", "feasible"}:
+            if "outputA" in res and "outputB" in res:
+                return float(res["outputA"] - res["outputB"])  # positive means A > B (violation)
+        return None
+
+    xgb_sev = _severity(xgb_result)
+    mlp_sev = _severity(mlp_result)
+    xgb_result["violation_severity"] = xgb_sev
+    mlp_result["violation_severity"] = mlp_sev
+
+    # Decide which model is worse (largest positive severity only)
+    worse = None
+    xs = xgb_sev if (xgb_sev is not None and xgb_sev > 0) else float("-inf")
+    ms = mlp_sev if (mlp_sev is not None and mlp_sev > 0) else float("-inf")
+    if xs == float("-inf") and ms == float("-inf"):
+        worse = None
+    elif xs == ms:
+        worse = "equal"
+    elif xs > ms:
+        worse = "xgboost"
+    else:
+        worse = "mlp"
+
+    return {"xgboost": xgb_result, "mlp": mlp_result, "worse_model_by_severity": worse}
 
 
 def _default_monotonicity_feature(feature_names: Sequence[str]) -> str:
@@ -772,38 +883,38 @@ def _default_sensitive_feature(feature_names: Sequence[str]) -> str:
                 return name
     return feature_names[0]
 
-def analyze_milp_complexity(prob: pulp.LpProblem, solve_time: float) -> Dict[str, Any]:
-    """
-    Extract exact mathematical complexity and results from the PuLP problem.
-    """
-    # Calculate the total number of constraints in the problem
-    num_constraints = len(prob.constraints)
+# def analyze_milp_complexity(prob: pulp.LpProblem, solve_time: float) -> Dict[str, Any]:
+#     """
+#     Extract exact mathematical complexity and results from the PuLP problem.
+#     """
+#     # Calculate the total number of constraints in the problem
+#     num_constraints = len(prob.constraints)
     
-    # Calculate total variables and specifically binary variables
-    variables = prob.variables()
-    num_total_vars = len(variables)
+#     # Calculate total variables and specifically binary variables
+#     variables = prob.variables()
+#     num_total_vars = len(variables)
     
-    # Binary variables are the main bottleneck for NP-Hard MILP problems
-    num_binaries = sum(
-        1 for v in variables 
-        if v.cat == pulp.LpInteger or v.cat == pulp.LpBinary
-    )
+#     # Binary variables are the main bottleneck for NP-Hard MILP problems
+#     num_binaries = sum(
+#         1 for v in variables 
+#         if v.cat == pulp.LpInteger or v.cat == pulp.LpBinary
+#     )
     
-    # Extract objective value if optimal
-    status = pulp.LpStatus[prob.status]
-    objective_value = None
-    if status == 'Optimal':
-        # Retrieve the maximum violation margin or minimum distance
-        objective_value = pulp.value(prob.objective)
+#     # Extract objective value if optimal
+#     status = pulp.LpStatus[prob.status]
+#     objective_value = None
+#     if status == 'Optimal':
+#         # Retrieve the maximum violation margin or minimum distance
+#         objective_value = pulp.value(prob.objective)
         
-    return {
-        "status": status,
-        "solve_time_sec": round(solve_time, 4),
-        "objective_value": objective_value,
-        "num_constraints": num_constraints,
-        "num_total_vars": num_total_vars,
-        "num_binary_vars": num_binaries
-    }
+#     return {
+#         "status": status,
+#         "solve_time_sec": round(solve_time, 4),
+#         "objective_value": objective_value,
+#         "num_constraints": num_constraints,
+#         "num_total_vars": num_total_vars,
+#         "num_binary_vars": num_binaries
+#     }
 
 
 def parse_args() -> argparse.Namespace:
@@ -894,26 +1005,12 @@ if __name__ == "__main__":
         # Fallback to zeros if dataset array is not found
         original_x_sample = np.zeros(len(feature_names))
 
-    if args.property == "compare":
-        print(f"Comparing XGBoost and MLP with monotonicity over '{target_feature_name}'")
-        result = compare_xgboost_and_mlp(
-            xgboost_path=args.xgboost_path,
-            mlp_path=args.mlp_path,
-            feature_names=feature_names,
-            property_name="monotonicity",
-            target_feature_name=target_feature_name,
-            bound_limit=args.bound_limit,
-            epsilon=args.epsilon,
-            output_margin=args.output_margin,
-            timeout_seconds=args.timeout_seconds,
-        )
-        print(result)
-    elif args.property == "monotonicity":
-        print(f"Running monotonicity MILP over '{target_feature_name}'")
-        print(
-            verify_property_milp(
-                model_kind="mlp",
-                model_path=args.mlp_path,
+    if args.property in ["compare", "monotonicity", "individual_fairness"]:
+        if args.property in ["compare", "monotonicity"]:
+            print(f"\n Comparing Monotonicity over '{target_feature_name}'...")
+            mono_result = compare_xgboost_and_mlp(
+                xgboost_path=args.xgboost_path,
+                mlp_path=args.mlp_path,
                 feature_names=feature_names,
                 property_name="monotonicity",
                 target_feature_name=target_feature_name,
@@ -922,7 +1019,42 @@ if __name__ == "__main__":
                 output_margin=args.output_margin,
                 timeout_seconds=args.timeout_seconds,
             )
-        )
+            
+            for model_name in ["xgboost", "mlp"]:
+                res = mono_result[model_name]
+                status = res['status']
+                time_sec = res.get('solve_seconds', 0)
+                print(f"  - {model_name.upper():<8} | Status: {status:<10} | Time: {time_sec:.4f}s")
+                if status.lower() in {"optimal", "feasible"}:
+                    print(f"             | Max Violation Margin (Severity): {res.get('violation_severity', 'N/A')}")
+            
+            print(f"  Worse Model by Monotonicity: {mono_result.get('worse_model_by_severity')}")
+
+        if args.property in ["compare", "individual_fairness"]:        
+            print(f"\n Comparing Individual Fairness over sensitive feature(s) {sensitive_feature_names}...")
+            fair_result = compare_xgboost_and_mlp(
+                xgboost_path=args.xgboost_path,
+                mlp_path=args.mlp_path,
+                feature_names=feature_names,
+                property_name="individual_fairness",
+                sensitive_feature_names=sensitive_feature_names,
+                bound_limit=args.bound_limit,
+                epsilon=args.epsilon,
+                output_margin=args.output_margin,
+                timeout_seconds=args.timeout_seconds,
+            )
+
+            for model_name in ["xgboost", "mlp"]:
+                res = fair_result[model_name]
+                status = res['status']
+                time_sec = res.get('solve_seconds', 0)
+                print(f"  - {model_name.upper():<8} | Status: {status:<10} | Time: {time_sec:.4f}s")
+                if status.lower() in {"optimal", "feasible"}:
+                    # 공정성은 출력값의 차이 절댓값이 심각도(Severity)가 됨
+                    diff = abs(res['outputA'] - res['outputB'])
+                    print(f"             | Max Fairness Violation (Diff): {diff:.6f}")
+
+            print("\n" + "="*70 + "\n")
     elif args.property == "local_robustness":
         print(f"Running Local Robustness MILP for customer index {args.sample_index}")
         print(f"Perturbation budget (epsilon): {args.epsilon}")
@@ -941,7 +1073,8 @@ if __name__ == "__main__":
         )
         
         # Print detailed results for both models
-        for model_name, model_result in result.items():
+        for model_name in ["xgboost", "mlp"]:
+            model_result = result[model_name]
             print(f"\n========== {model_name.upper()} ==========")
             print(f"Status: {model_result['status']}")
             print(f"Solve time: {model_result['solve_seconds']:.4f}s")
@@ -995,8 +1128,17 @@ if __name__ == "__main__":
             print(f"MODEL: {model_name}")
             print(f"{'='*70}")
             print(f"Status: {result['status']}")
-            print(f"Solve time: {result.get('solve_seconds', 'N/A'):.4f}s")
-            print(f"Wall time: {result.get('wall_seconds', 'N/A'):.4f}s")
+            solve_seconds = result.get('solve_seconds', None)
+            if isinstance(solve_seconds, (int, float)):
+                print(f"Solve time: {solve_seconds:.4f}s")
+            else:
+                print(f"Solve time: {solve_seconds}")
+
+            wall_seconds = result.get('wall_seconds', None)
+            if isinstance(wall_seconds, (int, float)):
+                print(f"Wall time: {wall_seconds:.4f}s")
+            else:
+                print(f"Wall time: {wall_seconds}")
             
             if result.get("status") == "Optimal":
                 print(f"\n  SUCCESS! Found actionable recourse plan.")
@@ -1039,17 +1181,14 @@ if __name__ == "__main__":
                 print(f"  Even with maximum allowed changes (within bounds), loan approval is not achievable.")
                 print(f"  Recommendation: Review lending criteria or consider other factors.")
     else:
-        print(f"Running individual fairness MILP over sensitive feature(s) {sensitive_feature_names}")
-        print(
-            verify_property_milp(
-                model_kind="mlp",
-                model_path=args.mlp_path,
-                feature_names=feature_names,
-                property_name="individual_fairness",
-                sensitive_feature_names=sensitive_feature_names,
-                bound_limit=args.bound_limit,
-                epsilon=args.epsilon,
-                output_margin=args.output_margin,
-                timeout_seconds=args.timeout_seconds,
-            )
+        valid_properties = [
+            "compare", 
+            "monotonicity", 
+            "individual_fairness", 
+            "local_robustness", 
+            "recourse"
+        ]
+        raise ValueError(
+            f"지원하지 않는 검증 속성(Property)이 입력되었습니다: '{args.property}'\n"
+            f"사용 가능한 옵션: {valid_properties}"
         )
