@@ -363,6 +363,148 @@ def _add_individual_fairness_constraints(
             problem += x_a[feature_index] == x_b[feature_index]
 
 
+def _add_local_robustness_constraints(
+    problem: pulp.LpProblem,
+    x_a: Sequence[pulp.LpVariable],
+    x_b: Sequence[pulp.LpVariable],
+    original_x: np.ndarray,
+    epsilon: float,
+) -> None:
+    """Add constraints for local robustness: x_a is within epsilon of x_b (original).
+    
+    x_a: perturbed input (MILP variables within epsilon of original)
+    x_b: original input (fixed to original_x)
+    
+    Violation case: model output flips (e.g., model(original) >= 0 but model(perturbed) < 0)
+    """
+    for feature_index in range(len(x_a)):
+        # x_a must be within epsilon L∞ ball of original_x
+        problem += x_a[feature_index] >= float(original_x[feature_index]) - epsilon
+        problem += x_a[feature_index] <= float(original_x[feature_index]) + epsilon
+        # x_b is fixed to original_x (the unperturbed reference)
+        problem += x_b[feature_index] == float(original_x[feature_index])
+
+
+def _categorize_features(feature_names: Sequence[str]) -> Dict[str, List[int]]:
+    """Categorize features into immutable, increasing-only, decreasing-only, and flexible.
+    
+    Returns:
+        Dict with keys: 'immutable', 'increasing_only', 'decreasing_only', 'flexible'
+    """
+    immutable_keywords = ["age", "sex", "gender", "race", "foreign", "marital"]
+    increasing_keywords = ["duration", "checking", "savings", "employment", "credit_history", "score", "income"]
+    decreasing_keywords = ["debt", "liabilities", "installment", "risk"]
+    
+    categorized = {
+        "immutable": [],
+        "increasing_only": [],
+        "decreasing_only": [],
+        "flexible": []
+    }
+    
+    for i, name in enumerate(feature_names):
+        name_lower = name.lower()
+        
+        if any(kw in name_lower for kw in immutable_keywords):
+            categorized["immutable"].append(i)
+        elif any(kw in name_lower for kw in increasing_keywords):
+            categorized["increasing_only"].append(i)
+        elif any(kw in name_lower for kw in decreasing_keywords):
+            categorized["decreasing_only"].append(i)
+        else:
+            categorized["flexible"].append(i)
+    
+    return categorized
+
+
+def _get_feature_costs(feature_names: Sequence[str]) -> np.ndarray:
+    """Assign cost weights to features (higher = harder to change).
+    
+    Returns:
+        Array of costs, one per feature.
+    """
+    costs = np.ones(len(feature_names), dtype=np.float64)
+    
+    # Immutable features have infinite cost (or very high)
+    for i, name in enumerate(feature_names):
+        name_lower = name.lower()
+        if any(kw in name_lower for kw in ["age", "sex", "gender", "race", "foreign"]):
+            costs[i] = 1e6  # Essentially immutable
+        # Employment is harder to change
+        elif "employment" in name_lower:
+            costs[i] = 5.0
+        # Credit history requires time
+        elif "credit_history" in name_lower:
+            costs[i] = 3.0
+        # Age requires time (decreasing direction not possible)
+        elif "age" in name_lower:
+            costs[i] = 1e6
+    
+    return costs
+
+
+def _add_recourse_constraints(
+    problem: pulp.LpProblem,
+    x_a: Sequence[pulp.LpVariable],
+    feature_names: Sequence[str],
+    original_x: np.ndarray,
+    bound_limit: float,
+) -> List[pulp.LpVariable]:
+    """Add recourse constraints: immutable features stay same, directional constraints apply.
+    
+    Returns:
+        List of distance variables for objective minimization.
+    """
+    # Normalize original_x should already be a numeric numpy array; if not, coerce safely
+    if isinstance(original_x, torch.Tensor):
+        original_x = original_x.detach().cpu().numpy()
+    elif hasattr(original_x, "to_numpy"):
+        # pandas Series/DataFrame
+        original_x = original_x.to_numpy()
+    elif hasattr(original_x, "values") and not callable(getattr(original_x, "values", None)):
+        original_x = np.asarray(original_x.values, dtype=np.float64)
+    else:
+        original_x = np.asarray(original_x, dtype=np.float64)
+    
+    input_dim = len(feature_names)
+    categorized = _categorize_features(feature_names)
+    costs = _get_feature_costs(feature_names)
+    
+    distance_vars = []
+    
+    for i in range(input_dim):
+        dist_var = pulp.LpVariable(f"dist_{i}", lowBound=0.0, cat="Continuous")
+        
+        # Create weighted absolute distance: cost * |x_a[i] - original_x[i]|
+        orig_val = float(original_x[i])
+        problem += dist_var >= costs[i] * (x_a[i] - orig_val)
+        problem += dist_var >= costs[i] * (orig_val - x_a[i])
+        
+        distance_vars.append(dist_var)
+        
+        # Apply directional constraints
+        if i in categorized["immutable"]:
+            # Immutable: cannot change
+            problem += x_a[i] == orig_val, f"Immutable_{i}_{feature_names[i]}"
+        
+        elif i in categorized["increasing_only"]:
+            # Can only increase or stay same
+            problem += x_a[i] >= orig_val, f"IncreasingOnly_{i}_{feature_names[i]}"
+            problem += x_a[i] <= bound_limit, f"BoundInc_{i}"
+        
+        elif i in categorized["decreasing_only"]:
+            # Can only decrease or stay same
+            problem += x_a[i] <= orig_val, f"DecreasingOnly_{i}_{feature_names[i]}"
+            problem += x_a[i] >= -bound_limit, f"BoundDec_{i}"
+        
+        else:
+            # Flexible: can change in both directions within bounds
+            problem += x_a[i] >= -bound_limit, f"LowerBound_{i}"
+            problem += x_a[i] <= bound_limit, f"UpperBound_{i}"
+    
+    return distance_vars
+
+
 def _build_problem_for_model(
     model_kind: str,
     model_path: str,
@@ -373,6 +515,7 @@ def _build_problem_for_model(
     bound_limit: float,
     epsilon: float,
     output_margin: float,
+    original_x : Optional[np.ndarray] = None,
 ) -> Tuple[pulp.LpProblem, Dict[str, Any]]:
     input_dim = len(feature_names)
     problem = pulp.LpProblem(f"{model_kind}_{property_name}_verification", pulp.LpMinimize)
@@ -390,6 +533,21 @@ def _build_problem_for_model(
         if not sensitive_indices:
             raise ValueError("sensitive_feature_names is required for individual_fairness")
         _add_individual_fairness_constraints(problem, x_a, x_b, sensitive_indices)
+    elif property_name == "local_robustness":
+        if original_x is None:
+            raise ValueError("original_x is required for local_robustness")
+        _add_local_robustness_constraints(problem, x_a, x_b, original_x, epsilon)
+    elif property_name == "recourse":
+        if original_x is None:
+            raise ValueError("original_x is required for recourse verification")
+        
+        # Add recourse constraints (immutable, directional, weighted distance)
+        distance_vars = _add_recourse_constraints(problem, x_a, feature_names, original_x, bound_limit)
+        
+        # Set objective: minimize weighted L1 distance
+        problem.sense = pulp.LpMinimize
+        problem.setObjective(pulp.lpSum(distance_vars))
+        
     else:
         raise ValueError(f"unsupported property: {property_name}")
 
@@ -410,13 +568,28 @@ def _build_problem_for_model(
         if "duration" in target_feature_name or "amount" in target_feature_name:
           problem += output_b >= output_a + output_margin
         else:
-            problem += output_a >= output_b + epsilon
-
+            problem += output_a >= output_b + output_margin
+    elif property_name == "local_robustness":
+        # Violation: output flips sign between original (x_b) and perturbed (x_a)
+        # Case 1: original approved (output_b >= 0) but perturbed rejected (output_a < 0)
+        # OR Case 2: original rejected (output_b < 0) but perturbed approved (output_a >= 0)
+        # We search for EITHER case by using a big-M disjunction.
+        # For simplicity, we search for Case 1 (original approved -> perturbed rejected)
+        problem += output_b >= output_margin, "OriginalApproved"
+        problem += output_a <= -output_margin, "PerturbedRejected"
+    elif property_name == "recourse":
+        # Force the model to approve (logit >= 0.0)
+        problem += output_a >= 0.0, "Must_Approve"
+    
     return problem, {"xA": x_a, "xB": x_b, "outputA": output_a, "outputB": output_b}
 
 
 def _solve_problem(problem: pulp.LpProblem, timeout_seconds: int) -> Tuple[str, Dict[str, Any]]:
+    num_constraints = len(problem.constraints)
+    num_binaries = sum(1 for v in problem.variables() if v.cat in [pulp.LpInteger, pulp.LpBinary])
+    
     solver = _build_solver(timeout_seconds)
+    
     start_time = time.perf_counter()
     if solver is None:
         problem.solve()
@@ -425,7 +598,11 @@ def _solve_problem(problem: pulp.LpProblem, timeout_seconds: int) -> Tuple[str, 
     elapsed = time.perf_counter() - start_time
 
     status = pulp.LpStatus.get(problem.status, str(problem.status))
-    return status, {"solve_seconds": elapsed, "solver": solver.__class__.__name__ if solver else "default"}
+    return status, {"solve_seconds": elapsed, 
+                    "solver": solver.__class__.__name__ if solver else "default",
+                    "num_constraints": num_constraints,
+                    "num_binary_vars": num_binaries
+                    }
 
 
 def verify_property_milp(
@@ -439,6 +616,8 @@ def verify_property_milp(
     epsilon: float = 0.01,
     output_margin: float = 1e-6,
     timeout_seconds: int = 60,
+    original_x: Optional[np.ndarray] = None,
+    original_output: Optional[float] = None,
 ) -> Dict[str, Any]:
     problem, payload = _build_problem_for_model(
         model_kind=model_kind,
@@ -450,6 +629,7 @@ def verify_property_milp(
         bound_limit=bound_limit,
         epsilon=epsilon,
         output_margin=output_margin,
+        original_x=original_x,
     )
     status, stats = _solve_problem(problem, timeout_seconds)
 
@@ -459,20 +639,60 @@ def verify_property_milp(
         "status": status,
         **stats,
     }
+    
+    # Include reference output if provided (useful for local_robustness)
+    if original_output is not None:
+        result["original_output"] = original_output
 
     if status.lower() in {"optimal", "feasible"}:
         x_a = np.array([pulp.value(var) for var in payload["xA"]], dtype=float)
         x_b = np.array([pulp.value(var) for var in payload["xB"]], dtype=float)
+        output_a = float(pulp.value(payload["outputA"]))
+        output_b = float(pulp.value(payload["outputB"]))
+        
         result.update(
             {
                 "xA": x_a,
                 "xB": x_b,
-                "outputA": float(pulp.value(payload["outputA"])),
-                "outputB": float(pulp.value(payload["outputB"])),
+                "outputA": output_a,
+                "outputB": output_b,
             }
         )
+        
+        # For local_robustness, compute the perturbation and output flip
+        if property_name == "local_robustness":
+            l_inf_distance = np.max(np.abs(x_a - x_b))
+            result["linf_perturbation"] = l_inf_distance
+            result["output_flip"] = output_a * output_b < 0  # True if signs differ
 
     return result
+
+
+def _compute_model_output(
+    model_kind: str,
+    model_path: str,
+    input_x: np.ndarray,
+    feature_names: Sequence[str],
+) -> float:
+    """Compute the model output for a single input."""
+    input_dim = len(feature_names)
+    if model_kind == "xgboost":
+        booster = _load_xgboost_booster(model_path)
+        return float(booster.predict(input_x.reshape(1, -1))[0])
+    elif model_kind == "mlp":
+        layers = _load_mlp_layers(model_path, input_dim=input_dim)
+        x = torch.tensor(input_x, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            for weight, bias in layers:
+                w = torch.tensor(weight, dtype=torch.float32)
+                b = torch.tensor(bias, dtype=torch.float32)
+                x = torch.nn.functional.linear(x, w, b)
+                # Apply ReLU for all but the last layer
+                if weight is not layers[-1][0]:
+                    x = torch.nn.functional.relu(x)
+        return float(x.squeeze().item())
+    else:
+        raise ValueError(f"unsupported model kind: {model_kind}")
 
 
 def compare_xgboost_and_mlp(
@@ -486,7 +706,15 @@ def compare_xgboost_and_mlp(
     epsilon: float = 0.01,
     output_margin: float = 1e-6,
     timeout_seconds: int = 60,
+    original_x: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
+    # Pre-compute original output if needed for local_robustness
+    original_output_xgb = None
+    original_output_mlp = None
+    if property_name == "local_robustness" and original_x is not None:
+        original_output_xgb = _compute_model_output("xgboost", xgboost_path, original_x, feature_names)
+        original_output_mlp = _compute_model_output("mlp", mlp_path, original_x, feature_names)
+
     xgb_start = time.perf_counter()
     xgb_result = verify_property_milp(
         model_kind="xgboost",
@@ -499,6 +727,8 @@ def compare_xgboost_and_mlp(
         epsilon=epsilon,
         output_margin=output_margin,
         timeout_seconds=timeout_seconds,
+        original_x=original_x,
+        original_output=original_output_xgb,
     )
     xgb_result["wall_seconds"] = time.perf_counter() - xgb_start
 
@@ -514,6 +744,8 @@ def compare_xgboost_and_mlp(
         epsilon=epsilon,
         output_margin=output_margin,
         timeout_seconds=timeout_seconds,
+        original_x=original_x,
+        original_output=original_output_mlp,
     )
     mlp_result["wall_seconds"] = time.perf_counter() - mlp_start
 
@@ -578,7 +810,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MILP verification for XGBoost and baseline MLP")
     parser.add_argument(
         "--property",
-        choices=["monotonicity", "individual_fairness", "compare"],
+        choices=["monotonicity", "individual_fairness", "compare", "recourse", "local_robustness"],
         default="compare",
         help="property to verify",
     )
@@ -590,7 +822,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epsilon", type=float, default=0.01)
     parser.add_argument("--output-margin", type=float, default=1e-6)
     parser.add_argument("--timeout-seconds", type=int, default=60)
+    parser.add_argument("--sample-index", type=int, default=0, help="Index of the customer data to use for recourse")
     return parser.parse_args()
+
+
+def _normalize_original_input(original_x, input_dim: int) -> np.ndarray:
+    """Robustly convert various input types to a numpy array of length input_dim.
+
+    Accepts: torch.Tensor, numpy array, pandas Series/row, list/tuple, or a tuple (x, y).
+    Raises a ValueError if the resulting array length doesn't match input_dim.
+    """
+    if original_x is None:
+        raise ValueError("original_x must not be None")
+
+    # If passed a (x, y) tuple (common from datasets), extract x
+    if isinstance(original_x, (list, tuple)) and len(original_x) > 0 and not isinstance(
+        original_x[0], (int, float, np.floating, np.integer, np.ndarray, torch.Tensor)
+    ):
+        # fallback: keep as-is
+        pass
+
+    if isinstance(original_x, tuple) and len(original_x) == 2:
+        original_x = original_x[0]
+
+    if isinstance(original_x, torch.Tensor):
+        arr = original_x.detach().cpu().numpy()
+    else:
+        try:
+            # pandas Series/DataFrame have to_numpy()
+            if hasattr(original_x, "to_numpy"):
+                arr = original_x.to_numpy()
+            elif hasattr(original_x, "values") and not callable(getattr(original_x, "values", None)):
+                arr = np.asarray(original_x.values)
+            else:
+                arr = np.asarray(original_x)
+        except Exception:
+            # Last resort: try elementwise conversion
+            arr = np.asarray([float(v) for v in original_x], dtype=np.float64)
+
+    arr = arr.astype(np.float64)
+    if arr.ndim > 1:
+        arr = arr.reshape(-1)
+    if arr.shape[0] != input_dim:
+        raise ValueError(f"original_x length {arr.shape[0]} does not match expected input_dim {input_dim}")
+    return arr
 
 
 if __name__ == "__main__":
@@ -600,6 +875,24 @@ if __name__ == "__main__":
 
     target_feature_name = args.target_feature or _default_monotonicity_feature(feature_names)
     sensitive_feature_names = args.sensitive_features or [_default_sensitive_feature(feature_names)]
+
+    dataset_x = bundle.get("X_test", bundle.get("X", None))
+
+    original_x_sample = None
+    if dataset_x is not None and len(dataset_x) > args.sample_index:
+        original_x_sample = dataset_x[args.sample_index]
+        # Normalize to numpy array with correct length
+        try:
+            original_x_sample = _normalize_original_input(original_x_sample, input_dim=len(feature_names))
+        except Exception:
+            # fallback: attempt to coerce safely
+            try:
+                original_x_sample = np.asarray(original_x_sample, dtype=np.float64)
+            except Exception:
+                original_x_sample = np.zeros(len(feature_names))
+    else:
+        # Fallback to zeros if dataset array is not found
+        original_x_sample = np.zeros(len(feature_names))
 
     if args.property == "compare":
         print(f"Comparing XGBoost and MLP with monotonicity over '{target_feature_name}'")
@@ -630,6 +923,121 @@ if __name__ == "__main__":
                 timeout_seconds=args.timeout_seconds,
             )
         )
+    elif args.property == "local_robustness":
+        print(f"Running Local Robustness MILP for customer index {args.sample_index}")
+        print(f"Perturbation budget (epsilon): {args.epsilon}")
+        
+        # Compare both models
+        result = compare_xgboost_and_mlp(
+            xgboost_path=args.xgboost_path,
+            mlp_path=args.mlp_path,
+            feature_names=feature_names,
+            property_name="local_robustness",
+            bound_limit=args.bound_limit,
+            epsilon=args.epsilon,
+            output_margin=args.output_margin,
+            timeout_seconds=args.timeout_seconds,
+            original_x=original_x_sample,
+        )
+        
+        # Print detailed results for both models
+        for model_name, model_result in result.items():
+            print(f"\n========== {model_name.upper()} ==========")
+            print(f"Status: {model_result['status']}")
+            print(f"Solve time: {model_result['solve_seconds']:.4f}s")
+            print(f"Wall time: {model_result['wall_seconds']:.4f}s")
+            
+            if model_result['status'].lower() in {"optimal", "feasible"}:
+                print(f"  VIOLATED: Found a counterexample within epsilon={args.epsilon}")
+                print(f"  Original output (x_b): {model_result['outputB']:.6f}")
+                print(f"  Perturbed output (x_a): {model_result['outputA']:.6f}")
+                print(f"  Output flip detected: {model_result.get('output_flip', False)}")
+                print(f"  L-inf perturbation distance: {model_result.get('linf_perturbation', 'N/A')}")
+                print(f"\n  Perturbed input differences:")
+                for i, name in enumerate(feature_names):
+                    diff = model_result['xA'][i] - model_result['xB'][i]
+                    if abs(diff) > 1e-6:
+                        print(f"    [{name}]: {diff:+.6f}")
+            else:
+                print(f"  VERIFIED: No violation found within epsilon={args.epsilon}")
+    elif args.property == "recourse":
+        print(f"Running Actionable Recourse MILP for customer index {args.sample_index}")
+        print(f"Goal: Find minimal changes to achieve loan approval\n")
+        
+        # Run for both models
+        xgb_result = verify_property_milp(
+            model_kind="xgboost",
+            model_path=args.xgboost_path,
+            feature_names=feature_names,
+            property_name="recourse",
+            bound_limit=args.bound_limit,
+            timeout_seconds=args.timeout_seconds,
+            original_x=original_x_sample,
+        )
+        
+        mlp_result = verify_property_milp(
+            model_kind="mlp",
+            model_path=args.mlp_path,
+            feature_names=feature_names,
+            property_name="recourse",
+            bound_limit=args.bound_limit,
+            timeout_seconds=args.timeout_seconds,
+            original_x=original_x_sample,
+        )
+        
+        # Get feature categorization for clear explanation
+        categorized = _categorize_features(feature_names)
+        costs = _get_feature_costs(feature_names)
+        
+        # Print results for both models
+        for model_name, result in [("XGBoost", xgb_result), ("MLP", mlp_result)]:
+            print(f"\n{'='*70}")
+            print(f"MODEL: {model_name}")
+            print(f"{'='*70}")
+            print(f"Status: {result['status']}")
+            print(f"Solve time: {result.get('solve_seconds', 'N/A'):.4f}s")
+            print(f"Wall time: {result.get('wall_seconds', 'N/A'):.4f}s")
+            
+            if result.get("status") == "Optimal":
+                print(f"\n  SUCCESS! Found actionable recourse plan.")
+                print(f"  Original model output: {result.get('original_output', 'N/A')}")
+                print(f"  New model output: {result['outputA']:.6f} (APPROVED)")
+                
+                print(f"\n--- RECOMMENDED ACTIONS ---")
+                print(f"{'Feature':<30} {'Current':<12} {'Recommended':<12} {'Change':<12} {'Category':<20}")
+                print(f"{'-'*86}")
+                
+                any_changes = False
+                for i, name in enumerate(feature_names):
+                    orig = original_x_sample[i]
+                    new = result["xA"][i]
+                    diff = new - orig
+                    
+                    # Determine category
+                    if i in categorized["immutable"]:
+                        category = "Immutable"
+                    elif i in categorized["increasing_only"]:
+                        category = "Increase only"
+                    elif i in categorized["decreasing_only"]:
+                        category = "Decrease only"
+                    else:
+                        category = "Flexible"
+                    
+                    if abs(diff) > 1e-5:
+                        any_changes = True
+                        direction = "Increase" if diff > 0 else "Decrease"
+                        print(f"{name:<30} {orig:<12.4f} {new:<12.4f} {diff:+.4f} ({direction:<8}) {category:<20}")
+                
+                if not any_changes:
+                    print("No changes needed - customer already qualifies for approval!")
+                else:
+                    print(f"\nNote: Immutable features (age, gender, race, etc.) cannot be changed.")
+                    print(f"      Directional constraints apply to features based on feasibility.")
+            else:
+                print(f"\n  NO SOLUTION FOUND")
+                print(f"  Reason: {result.get('status', 'Unknown')}")
+                print(f"  Even with maximum allowed changes (within bounds), loan approval is not achievable.")
+                print(f"  Recommendation: Review lending criteria or consider other factors.")
     else:
         print(f"Running individual fairness MILP over sensitive feature(s) {sensitive_feature_names}")
         print(
