@@ -21,7 +21,7 @@ GERMAN_COLUMNS = [
 def load_and_preprocess_data(test_size=0.2, batch_size=32, random_state=42):
     """Prepare German Credit data and return tensors/loaders plus numpy arrays for other models."""
     # 1. 데이터 로드
-    # 1. Load the dataset from the UCI repository.
+    # Load the dataset from the UCI repository.
     print("Loading data from UCI repository...")
 
     # 공백 단위로 구분된 원본 데이터 읽기
@@ -31,16 +31,16 @@ def load_and_preprocess_data(test_size=0.2, batch_size=32, random_state=42):
     y = data["class"]
 
     # 2. 타겟 변수 전처리 (UCI 원본은 1이 승인, 2가 거절을 의미함)
-    # 2. Preprocess target labels (in UCI data, 1 means approved and 2 means rejected).
+    # Preprocess target labels (in UCI data, 1 means approved and 2 means rejected).
     y = y.map({1: 1, 2: 0}).astype(int)
 
     # 3. 특성 분리 (수치형 vs 범주형)
-    # 3. Split features into numeric and categorical groups.
+    # Split features into numeric and categorical groups.
     numeric_features = X.select_dtypes(include=["int64", "float64"]).columns
     categorical_features = X.select_dtypes(include=["object"]).columns
 
     # 4. 전처리 파이프라인 구성
-    # 4. Build the preprocessing pipeline.
+    # Build the preprocessing pipeline.
     # SMT 솔버(Marabou) 검증 시 수식 범위를 제한하기 위해 StandardScaler 적용.
     # Apply StandardScaler to keep the expression range limited during SMT solver (Marabou) verification.
     preprocessor = ColumnTransformer(
@@ -55,18 +55,18 @@ def load_and_preprocess_data(test_size=0.2, batch_size=32, random_state=42):
     X_processed = preprocessor.fit_transform(X)
 
     # 5. PyTorch 텐서로 변환
-    # 5. Convert processed arrays to PyTorch tensors.
+    # Convert processed arrays to PyTorch tensors.
     X_tensor = torch.tensor(X_processed, dtype=torch.float32)
     y_tensor = torch.tensor(y.values, dtype=torch.float32).unsqueeze(1)
 
     # 6. 학습/테스트 데이터셋 분리
-    # 6. Split tensors into training and test datasets.
+    # Split tensors into training and test datasets.
     X_train, X_test, y_train, y_test = train_test_split(
         X_tensor, y_tensor, test_size=test_size, random_state=random_state
     )
 
     # 7. PyTorch DataLoader 생성
-    # 7. Create PyTorch DataLoaders for batch iteration.
+    # Create PyTorch DataLoaders for batch iteration.
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
