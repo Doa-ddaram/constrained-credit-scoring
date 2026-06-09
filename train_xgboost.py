@@ -1,3 +1,5 @@
+import os
+
 import xgboost as xgb
 from sklearn.metrics import accuracy_score
 
@@ -25,6 +27,9 @@ def build_monotone_constraints(feature_names):
 def train_xgboost_with_monotone_constraints():
     data = load_and_preprocess_data()
     feature_names = data["feature_names"]
+    save_dir = "saved_weights"
+    os.makedirs(save_dir, exist_ok=True)
+    best_model_path = os.path.join(save_dir, "best_xgboost.json")
 
     monotone_constraints = build_monotone_constraints(feature_names)
     print(
@@ -46,6 +51,9 @@ def train_xgboost_with_monotone_constraints():
     y_pred = model.predict(data["X_test_np"])
     accuracy = accuracy_score(data["y_test_np"], y_pred)
     print(f"XGBoost training completed. Test accuracy: {accuracy * 100:.2f}%")
+
+    model.save_model(best_model_path)
+    print(f"Saved trained XGBoost model to '{best_model_path}'")
 
     return model, data
 
